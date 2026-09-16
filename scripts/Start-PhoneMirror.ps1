@@ -49,15 +49,65 @@ function Install-Scrcpy {
     }
 }
 
+function Invoke-AdbCommand {
+    param(
+        [Parameter(Mandatory)][string]$AdbPath,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+
+    # ADB writes routine daemon startup messages to stderr. Windows PowerShell
+    # turns those lines into error records, so temporarily allow native stderr
+    # and decide success from ADB's exit code instead.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $AdbPath @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    [pscustomobject]@{
+        ExitCode = $exitCode
+        Output   = @($output | ForEach-Object { $_.ToString() })
+    }
+}
+
+function Start-AdbServer {
+    param([Parameter(Mandatory)][string]$AdbPath)
+
+    $lastResult = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        if ($attempt -gt 1) {
+            $null = Invoke-AdbCommand -AdbPath $AdbPath -Arguments @('kill-server')
+            Start-Sleep -Seconds 1
+        }
+
+        $lastResult = Invoke-AdbCommand -AdbPath $AdbPath -Arguments @('start-server')
+        if ($lastResult.ExitCode -eq 0) {
+            return
+        }
+
+        Start-Sleep -Seconds 1
+    }
+
+    $details = ($lastResult.Output -join ' ').Trim()
+    if (-not $details) {
+        $details = "exit code $($lastResult.ExitCode)"
+    }
+    throw "ADB server could not start after 3 attempts: $details"
+}
+
 function Get-AdbDevices {
     param([Parameter(Mandatory)][string]$AdbPath)
 
-    $output = & $AdbPath devices 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw 'ADB could not check the connected devices.'
+    $result = Invoke-AdbCommand -AdbPath $AdbPath -Arguments @('devices')
+    if ($result.ExitCode -ne 0) {
+        $details = ($result.Output -join ' ').Trim()
+        throw "ADB could not check the connected devices: $details"
     }
 
-    $devices = foreach ($line in $output) {
+    $devices = foreach ($line in $result.Output) {
         if ($line -match '^(?<Serial>\S+)\s+(?<State>device|unauthorized|offline)\s*$') {
             [pscustomobject]@{
                 Serial = $Matches.Serial
@@ -82,12 +132,19 @@ function Wait-ForAuthorizedPhone {
     Write-Host '  3. Tap Allow on the USB debugging prompt.'
     Write-Host 'The launcher will continue automatically.'
 
-    & $AdbPath start-server *> $null
+    Start-AdbServer -AdbPath $AdbPath
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastMessage = ''
 
     while ((Get-Date) -lt $deadline) {
-        $devices = @(Get-AdbDevices -AdbPath $AdbPath)
+        try {
+            $devices = @(Get-AdbDevices -AdbPath $AdbPath)
+        } catch {
+            Write-Host 'ADB connection reset. Restarting it automatically...' -ForegroundColor Yellow
+            Start-AdbServer -AdbPath $AdbPath
+            Start-Sleep -Seconds 1
+            continue
+        }
         $authorized = @($devices | Where-Object State -eq 'device')
         $unauthorized = @($devices | Where-Object State -eq 'unauthorized')
 
@@ -143,22 +200,28 @@ try {
         exit 0
     }
 
-    Wait-ForAuthorizedPhone -AdbPath $adbPath
+    while ($true) {
+        Wait-ForAuthorizedPhone -AdbPath $adbPath
 
-    Write-Step 'Starting the mirror with the phone display off'
-    Write-Host 'The phone remains powered on and controllable from the laptop.'
-    Write-Host 'In the mirror: Alt+O turns the phone display off; Alt+Shift+O turns it on.'
+        Write-Step 'Starting the mirror in lock-screen compatible mode'
+        Write-Host 'The phone remains powered on and controllable from the laptop.'
+        Write-Host 'Android input injection is enabled for better password-field compatibility.'
+        Write-Host 'After unlocking: Alt+O turns the phone display off; Alt+Shift+O turns it on.'
 
-    Push-Location $scrcpyDirectory
-    try {
-        & $scrcpyPath --select-usb --turn-screen-off --stay-awake
-        $scrcpyExitCode = $LASTEXITCODE
-    } finally {
-        Pop-Location
-    }
+        Push-Location $scrcpyDirectory
+        try {
+            & $scrcpyPath --select-usb --no-audio --keyboard=sdk --mouse=sdk --prefer-text --keep-active
+            $scrcpyExitCode = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
 
-    if ($scrcpyExitCode -ne 0) {
-        throw "scrcpy stopped with exit code $scrcpyExitCode."
+        if ($scrcpyExitCode -eq 0) {
+            break
+        }
+
+        Write-Host "`nThe mirror connection ended. Waiting for the phone to reconnect after USB interruption or reboot..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
     }
 } catch {
     Write-Host "`nERROR: $($_.Exception.Message)" -ForegroundColor Red
